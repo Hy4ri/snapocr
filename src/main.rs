@@ -54,7 +54,6 @@ impl SnapApp {
             let mut gray = scaled.to_luma8();
 
             // 2. Detect dark-mode background and invert to black-on-white
-            // Sample the outer border pixels to estimate background luminance
             let mut border_sum: u64 = 0;
             let mut border_count: u64 = 0;
             let gw = gray.width();
@@ -71,14 +70,12 @@ impl SnapApp {
             }
             let avg_border_luma = (border_sum / border_count.max(1)) as u8;
             if avg_border_luma < 128 {
-                // Invert dark background so text is dark on light background
                 for p in gray.pixels_mut() {
                     p[0] = 255 - p[0];
                 }
             }
 
-            // 3. Add a generous white border (padding) around the cropped text.
-            // Tesseract character segmentation severely degrades if letters touch the crop boundary.
+            // 3. Add clean white border padding around crop
             let pad = 24u32;
             let padded_w = gw + pad * 2;
             let padded_h = gh + pad * 2;
@@ -100,14 +97,22 @@ impl SnapApp {
             }
 
             let resolved_lang = if lang == "auto" || lang.is_empty() {
-                detect_available_langs().unwrap_or_else(|| "ara+eng".to_string())
+                detect_available_langs().unwrap_or_else(|| "eng+ara".to_string())
             } else {
                 lang
             };
 
-            // Try primary pass with PSM 6 (uniform block of text), fallback to PSM 3 (auto) if needed
-            let text = run_tesseract(&ppm_bytes, &resolved_lang, "6")
-                .or_else(|_| run_tesseract(&ppm_bytes, &resolved_lang, "3"))?;
+            // Multi-strategy OCR:
+            // 1. Try PSM 6 (uniform block of text / multiline)
+            // 2. Try PSM 13 (raw single line / UI text snippets — vital for short Arabic/English lines)
+            // 3. Try PSM 3 (fully automatic page segmentation fallback)
+            let mut text = run_tesseract(&ppm_bytes, &resolved_lang, "6").unwrap_or_default();
+            if text.is_empty() {
+                text = run_tesseract(&ppm_bytes, &resolved_lang, "13").unwrap_or_default();
+            }
+            if text.is_empty() {
+                text = run_tesseract(&ppm_bytes, &resolved_lang, "3").unwrap_or_default();
+            }
 
             if text.is_empty() {
                 return Err("No text detected in region".to_string());
@@ -191,7 +196,7 @@ fn run_tesseract(ppm_bytes: &[u8], lang: &str, psm: &str) -> Result<String, Stri
     Ok(text)
 }
 
-/// Discovers installed Tesseract language models with Arabic script priority (e.g. "ara+eng")
+/// Discovers installed Tesseract language models (e.g. "eng+ara")
 fn detect_available_langs() -> Option<String> {
     let out = Command::new("tesseract").arg("--list-langs").output().ok()?;
     if !out.status.success() {
@@ -214,13 +219,8 @@ fn detect_available_langs() -> Option<String> {
     if langs.is_empty() {
         None
     } else {
-        // Prioritize Arabic script first, then English, then alphabetical
         langs.sort_by(|a, b| {
-            if a == "ara" {
-                std::cmp::Ordering::Less
-            } else if b == "ara" {
-                std::cmp::Ordering::Greater
-            } else if a == "eng" {
+            if a == "eng" {
                 std::cmp::Ordering::Less
             } else if b == "eng" {
                 std::cmp::Ordering::Greater
