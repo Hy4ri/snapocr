@@ -33,6 +33,8 @@
             # xcap wayland capture backend (pipewire + gbm)
             pipewire
             libgbm
+            # grim for wayland screenshot (hyprland, sway, etc.)
+            grim
             # pipewire-sys bindgen needs libclang
             clang
             libclang.lib
@@ -59,7 +61,7 @@
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           postInstall = ''
             wrapProgram $out/bin/snapocr \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) ]} \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.grim ]} \
               --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)}
           '';
         };

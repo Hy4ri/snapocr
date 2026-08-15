@@ -1,6 +1,6 @@
 // snapocr — select a screen region, OCR it, copy to clipboard.
-// X11/Xwayland: native XCB grab via xcap.
-// Wayland: XDG Desktop Portal screenshot via xcap.
+// Wayland: grim for screenshot (works on Hyprland, Sway, etc.)
+// X11/Xwayland: xcap native XCB grab.
 use std::process::Command;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -248,6 +248,49 @@ impl eframe::App for SnapApp {
     }
 }
 
+/// Capture the screen. Wayland: grim → file → load. X11: xcap native.
+fn capture_screen() -> Result<RgbaImage, String> {
+    // try grim first (wayland - works on hyprland, sway, etc.)
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        let tmp = std::env::temp_dir().join(format!("snapocr-grab-{}.png", std::process::id()));
+        let out = Command::new("grim")
+            .arg(&tmp)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let img = image::open(&tmp)
+                    .map_err(|e| format!("load grim output: {e}"))?
+                    .to_rgba8();
+                let _ = std::fs::remove_file(&tmp);
+                if img.width() > 0 && img.height() > 0 {
+                    return Ok(img);
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("snapocr: grim failed: {}", stderr.trim());
+            }
+            Err(e) => {
+                eprintln!("snapocr: grim not found ({e}), trying xcap...");
+            }
+        }
+    }
+
+    // fallback: xcap (works on X11/Xwayland)
+    let monitors = xcap::Monitor::all().map_err(|e| format!("xcap monitors: {e}"))?;
+    let monitor = monitors
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no monitors found".to_string())?;
+    let raw = monitor
+        .capture_image()
+        .map_err(|e| format!("xcap capture: {e}"))?;
+    if raw.width() == 0 || raw.height() == 0 {
+        return Err("captured empty image".to_string());
+    }
+    Ok(raw)
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let lang = args
@@ -257,26 +300,15 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(|| "eng".to_string());
     let debug = args.iter().any(|a| a == "--debug");
 
-    let monitors = xcap::Monitor::all().unwrap_or_default();
-    let monitor = match monitors.into_iter().next() {
-        Some(m) => m,
-        None => {
-            eprintln!("snapocr: no monitors found");
-            std::process::exit(1);
-        }
-    };
-    let raw = match monitor.capture_image() {
+    let raw = match capture_screen() {
         Ok(img) => img,
         Err(e) => {
-            eprintln!("snapocr: capture failed: {e}");
-            eprintln!("  (on wayland, make sure xdg-desktop-portal is running)");
+            eprintln!("snapocr: {e}");
+            eprintln!("  wayland: install grim (nix-shell -p grim)");
+            eprintln!("  x11: make sure DISPLAY is set");
             std::process::exit(1);
         }
     };
-    if raw.width() == 0 || raw.height() == 0 {
-        eprintln!("snapocr: captured empty image");
-        std::process::exit(1);
-    }
 
     let w = raw.width() as f32;
     let h = raw.height() as f32;
