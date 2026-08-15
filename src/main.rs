@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, ScrollArea, Sense,
     Stroke, StrokeKind, Vec2,
 };
-use image::{ImageFormat, RgbaImage};
+use image::{imageops::FilterType, ImageFormat, RgbaImage};
 
 const MIN_SEL: f32 = 6.0;
 const AUTO_CLOSE: Duration = Duration::from_millis(2800);
@@ -45,10 +45,16 @@ impl SnapApp {
         let debug = self.debug;
 
         self.stage = Stage::Ocr(Some(std::thread::spawn(move || {
-            // Speed optimization: In-memory grayscale + uncompressed/fast PPM encode over stdin
-            // avoids disk I/O latency completely.
-            let gray = image::DynamicImage::ImageRgba8(crop).to_luma8();
-            let mut ppm_bytes = Vec::with_capacity((w * h + 64) as usize);
+            // Screen fonts are low resolution (96 DPI). Tesseract expects ~300 DPI.
+            // Upscaling 2.5x with Lanczos/CatmullRom + grayscale turns small blurry UI glyphs into crisp characters.
+            let dyn_img = image::DynamicImage::ImageRgba8(crop);
+            let target_w = (w as f32 * 2.5).round() as u32;
+            let target_h = (h as f32 * 2.5).round() as u32;
+
+            let scaled = dyn_img.resize_exact(target_w, target_h, FilterType::CatmullRom);
+            let gray = scaled.to_luma8();
+
+            let mut ppm_bytes = Vec::with_capacity((target_w * target_h + 64) as usize);
             gray.write_to(
                 &mut std::io::Cursor::new(&mut ppm_bytes),
                 ImageFormat::Pnm,
@@ -61,15 +67,17 @@ impl SnapApp {
                 let _ = gray.save(&png_path);
             }
 
+            // Run tesseract with PSM 3 (auto page segmentation) or PSM 11 (sparse text).
+            // dpi 300 hint tells tesseract how to interpret character scale.
             let mut child = Command::new("tesseract")
                 .arg("stdin")
                 .arg("stdout")
                 .arg("-l")
                 .arg(&lang)
                 .arg("--psm")
-                .arg("6")
-                .arg("-c")
-                .arg("tessedit_do_invert=0")
+                .arg("3")
+                .arg("--dpi")
+                .arg("300")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
