@@ -10,7 +10,7 @@
         nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
 
       tesseractFull = pkgs:
-        pkgs.tesseract.override { enableLanguages = [ "eng" "ara" ]; };
+        pkgs.tesseract.override { enableLanguages = [ "eng" "ara" "osd" ]; };
 
       runtimeLibs = pkgs: with pkgs; [ libGL libxkbcommon wayland libxcb libgbm ];
     in
