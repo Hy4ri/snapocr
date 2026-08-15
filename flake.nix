@@ -30,6 +30,12 @@
             libGL
             fontconfig
             dejavu_fonts
+            # xcap wayland capture backend (pipewire portal)
+            pipewire
+            libgbm
+            # pipewire-sys bindgen needs libclang
+            clang
+            libclang.lib
             # headless test rig
             xvfb-run
             xdotool
@@ -38,6 +44,7 @@
             imagemagick
           ];
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (runtimeLibs pkgs);
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
         };
       });
 
@@ -48,7 +55,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
-          buildInputs = with pkgs; [ xorg.libxcb xorg.xcbproto libxkbcommon wayland libGL ];
+          buildInputs = with pkgs; [ xorg.libxcb xorg.xcbproto libxkbcommon wayland libGL pipewire ];
           postInstall = ''
             wrapProgram $out/bin/snapocr \
               --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) ]} \

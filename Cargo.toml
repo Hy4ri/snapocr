@@ -5,3 +5,7 @@ edition = "2021"
 description = "Select a screen region, OCR it, copy to clipboard"
 
 [dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+image = "0.25.10"
+xcap = "0.9.8"

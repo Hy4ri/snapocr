@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, Image, Pos2, Rect, ScrollArea, Sense, Stroke,
-    Vec2,
+    StrokeKind, Vec2,
 };
 use image::RgbaImage;
 
@@ -72,22 +72,31 @@ impl SnapApp {
     }
 
     fn poll_ocr(&mut self) {
-        if let Stage::Ocr(Some(h)) = &mut self.stage {
-            if h.is_finished() {
-                let res = h
-                    .join()
-                    .map_err(|_| "ocr thread panicked".to_string())
-                    .unwrap_or_else(|e| Err(e));
-                self.stage = match res {
-                    Ok(text) => match Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
-                        Ok(_) => Stage::Done { at: Instant::now(), text },
-                        Err(e) => Stage::Fail {
+        if let Stage::Ocr(ref mut opt) = self.stage {
+            if opt.as_ref().map_or(false, |h| h.is_finished()) {
+                if let Some(handle) = opt.take() {
+                    let res = handle
+                        .join()
+                        .unwrap_or_else(|_| Err("ocr thread panicked".to_string()));
+                    self.stage = match res {
+                        Ok(text) => {
+                            match Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+                                Ok(_) => Stage::Done {
+                                    at: Instant::now(),
+                                    text,
+                                },
+                                Err(e) => Stage::Fail {
+                                    at: Instant::now(),
+                                    msg: format!("clipboard: {e}"),
+                                },
+                            }
+                        }
+                        Err(msg) => Stage::Fail {
                             at: Instant::now(),
-                            msg: format!("clipboard: {e}"),
+                            msg,
                         },
-                    },
-                    Err(msg) => Stage::Fail { at: Instant::now(), msg },
-                };
+                    };
+                }
             }
         }
     }
@@ -104,111 +113,115 @@ impl SnapApp {
 }
 
 impl eframe::App for SnapApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.poll_ocr();
-        self.maybe_auto_close(ctx);
+        self.maybe_auto_close(&ctx);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        let (mut sel_start, mut sel_cur) = (self.start, self.cur);
         let mut ocr_sel: Option<Rect> = None;
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
-                ScrollArea::both().show(ui, |ui| {
-                    let resp = ui.add(Image::new(&self.tex).sense(Sense::drag()));
-                    let origin = resp.rect.min;
-                    let to_img = |p: Pos2| p - origin;
+        ScrollArea::both().show(ui, |ui| {
+            let resp = ui.add(Image::new(&self.tex).sense(Sense::drag()));
+            let origin = resp.rect.min;
 
-                    if resp.drag_started() {
-                        sel_start = resp.interact_pointer_pos().map(to_img);
-                        sel_cur = sel_start;
+            if resp.drag_started() {
+                self.start = resp
+                    .interact_pointer_pos()
+                    .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
+                self.cur = self.start;
+            }
+            if resp.dragged() {
+                self.cur = resp
+                    .interact_pointer_pos()
+                    .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
+            }
+            if resp.drag_stopped() {
+                if let (Some(s), Some(c)) = (self.start, self.cur) {
+                    let r = Rect::from_two_pos(s, c);
+                    if r.width() >= MIN_SEL && r.height() >= MIN_SEL {
+                        ocr_sel = Some(r);
                     }
-                    if resp.dragged() {
-                        sel_cur = resp.interact_pointer_pos().map(to_img);
-                    }
-                    if resp.drag_stopped() {
-                        if let (Some(s), Some(c)) = (sel_start, sel_cur) {
-                            let r = Rect::from_two_pos(s, c);
-                            if r.width() >= MIN_SEL && r.height() >= MIN_SEL {
-                                ocr_sel = Some(r);
-                            }
-                        }
-                        sel_start = None;
-                        sel_cur = None;
-                    }
+                }
+                self.start = None;
+                self.cur = None;
+            }
 
-                    if let (Some(s), Some(c)) = (sel_start, sel_cur) {
-                        let a = origin + s;
-                        let b = origin + c;
-                        let r = Rect::from_two_pos(a, b);
-                        let painter = ui.painter();
-                        let dim = Color32::from_black_alpha(110);
-                        let img_w = self.raw.width() as f32;
-                        let img_h = self.raw.height() as f32;
-                        // dim everything outside the selection
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, origin.y),
-                                Pos2::new(origin.x + img_w, r.min.y.max(origin.y)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, r.max.y.min(origin.y + img_h)),
-                                Pos2::new(origin.x + img_w, origin.y + img_h),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, r.min.y.max(origin.y)),
-                                Pos2::new(r.min.x.max(origin.x), r.max.y.min(origin.y + img_h)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(r.max.x.min(origin.x + img_w), r.min.y.max(origin.y)),
-                                Pos2::new(origin.x + img_w, r.max.y.min(origin.y + img_h)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_stroke(
-                            r,
-                            0.0,
-                            Stroke::new(2.0, Color32::from_rgb(255, 90, 90)),
-                        );
-                        painter.text(
-                            r.min + Vec2::new(4.0, -20.0),
-                            Align2::LEFT_BOTTOM,
-                            format!("{}×{}", r.width() as u32, r.height() as u32),
-                            FontId::monospace(14.0),
-                            Color32::WHITE,
-                        );
-                    }
-                });
-            });
+            // draw selection overlay
+            if let (Some(s), Some(c)) = (self.start, self.cur) {
+                let a = Pos2::new(origin.x + s.x, origin.y + s.y);
+                let b = Pos2::new(origin.x + c.x, origin.y + c.y);
+                let r = Rect::from_two_pos(a, b);
+                let painter = ui.painter();
+                let dim = Color32::from_black_alpha(110);
+                let img_w = self.raw.width() as f32;
+                let img_h = self.raw.height() as f32;
 
-        self.start = sel_start;
-        self.cur = sel_cur;
+                // dim everything outside the selection (4 rects: top, bottom, left, right)
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(origin.x, origin.y),
+                        Pos2::new(origin.x + img_w, r.min.y.max(origin.y)),
+                    ),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(origin.x, r.max.y.min(origin.y + img_h)),
+                        Pos2::new(origin.x + img_w, origin.y + img_h),
+                    ),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(origin.x, r.min.y.max(origin.y)),
+                        Pos2::new(r.min.x.max(origin.x), r.max.y.min(origin.y + img_h)),
+                    ),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(r.max.x.min(origin.x + img_w), r.min.y.max(origin.y)),
+                        Pos2::new(origin.x + img_w, r.max.y.min(origin.y + img_h)),
+                    ),
+                    0.0,
+                    dim,
+                );
+
+                // selection border
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    Stroke::new(2.0, Color32::from_rgb(255, 90, 90)),
+                    StrokeKind::Outside,
+                );
+
+                // size label
+                painter.text(
+                    r.min + Vec2::new(4.0, -20.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("{}×{}", r.width() as u32, r.height() as u32),
+                    FontId::monospace(14.0),
+                    Color32::WHITE,
+                );
+            }
+        });
+
         if let Some(r) = ocr_sel {
             self.begin_ocr(r);
         }
 
-        // status banner
+        // status banner at bottom center
         egui::Area::new(egui::Id::new("status"))
             .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| match &self.stage {
                     Stage::Ready => {
                         ui.label("drag to select a region · esc to quit");
@@ -219,7 +232,7 @@ impl eframe::App for SnapApp {
                     Stage::Done { text, .. } => {
                         ui.colored_label(
                             Color32::from_rgb(120, 220, 120),
-                            "copied to clipboard",
+                            "copied to clipboard ✓",
                         );
                         ui.separator();
                         ui.label(egui::RichText::new(text).monospace().size(13.0));
@@ -227,28 +240,12 @@ impl eframe::App for SnapApp {
                     Stage::Fail { msg, .. } => {
                         ui.colored_label(
                             Color32::from_rgb(255, 120, 120),
-                            format!("{msg} · esc to quit"),
+                            format!("✗ {msg} · esc to quit"),
                         );
                     }
                 });
             });
     }
-}
-
-fn pick_monitor() -> Option<xcap::Monitor> {
-    let all = xcap::Monitor::all().ok()?;
-    if all.is_empty() {
-        return None;
-    }
-    if let Ok((cx, cy)) = xcap::cursor_position() {
-        if let Some(m) = all.iter().find(|m| {
-            let (x, y, w, h) = (m.x(), m.y(), m.width(), m.height());
-            cx >= x && cx < x + w && cy >= y && cy < y + h
-        }) {
-            return Some(m.clone());
-        }
-    }
-    all.into_iter().next()
 }
 
 fn main() -> eframe::Result<()> {
@@ -260,7 +257,8 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(|| "eng".to_string());
     let debug = args.iter().any(|a| a == "--debug");
 
-    let monitor = match pick_monitor() {
+    let monitors = xcap::Monitor::all().unwrap_or_default();
+    let monitor = match monitors.into_iter().next() {
         Some(m) => m,
         None => {
             eprintln!("snapocr: no monitors found");
