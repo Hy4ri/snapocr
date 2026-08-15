@@ -20,8 +20,10 @@
             cargo
             pkg-config
             (tesseractFull pkgs)
-            grim
-            slurp
+            wayland
+            libxkbcommon
+            libgbm
+            libGL
             libnotify
             wl-clipboard
           ];
@@ -35,9 +37,11 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
+          buildInputs = with pkgs; [ wayland libxkbcommon libgbm libGL ];
           postInstall = ''
             wrapProgram $out/bin/snapocr \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.grim pkgs.slurp pkgs.libnotify pkgs.wl-clipboard ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.libnotify pkgs.wl-clipboard ]} \
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libxkbcommon pkgs.libgbm pkgs.libGL ]}
           '';
         };
       });

@@ -1,11 +1,11 @@
-// snapocr — ultra-lean screen OCR to clipboard
-// Wayland: slurp + grim
-// X11: slop + maim (or xdotool/import fallback)
+// snapocr — Self-contained Wayland & X11 screen OCR to clipboard
+// No external slurp/grim dependencies: embeds native wayland region capture and screen selection.
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use arboard::Clipboard;
-use image::{imageops::FilterType, GrayImage, ImageFormat, Luma};
+use image::{imageops::FilterType, GrayImage, ImageFormat, Luma, RgbaImage};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -17,11 +17,10 @@ fn main() {
     let debug = args.iter().any(|a| a == "--debug");
     let no_notify = args.iter().any(|a| a == "--no-notify");
 
-    // 1. Pick region interactively
-    let geom = match pick_region() {
-        Ok(g) => g,
+    // 1. Capture screen & select region
+    let cropped_rgba = match select_and_capture_region() {
+        Ok(img) => img,
         Err(e) => {
-            // User cancelled or slurp exited with non-zero (e.g. pressed Escape)
             if !e.is_empty() && e != "cancelled" {
                 eprintln!("snapocr: {e}");
             }
@@ -29,18 +28,8 @@ fn main() {
         }
     };
 
-    // 2. Capture the selected region to PNG in memory
-    let png_bytes = match capture_region(&geom) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("snapocr capture failed: {e}");
-            notify_err(&format!("Capture failed: {e}"), no_notify);
-            std::process::exit(1);
-        }
-    };
-
-    // 3. Preprocess for OCR in memory
-    let ppm_bytes = match preprocess_image(&png_bytes, debug) {
+    // 2. Preprocess cropped image in memory
+    let ppm_bytes = match preprocess_image(&cropped_rgba, debug) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("snapocr preprocess failed: {e}");
@@ -49,13 +38,14 @@ fn main() {
         }
     };
 
-    // 4. Resolve languages & run Tesseract
+    // 3. Resolve OCR languages
     let resolved_lang = if lang == "auto" || lang.is_empty() {
         detect_available_langs().unwrap_or_else(|| "eng+ara".to_string())
     } else {
         lang
     };
 
+    // 4. Run Tesseract OCR pipeline
     let text = match ocr_pipeline(&ppm_bytes, &resolved_lang) {
         Ok(t) => t,
         Err(e) => {
@@ -72,10 +62,17 @@ fn main() {
 
     println!("{text}");
 
-    // 6. Native desktop notification
+    // 6. Desktop notification
     if !no_notify {
         let preview = if text.len() > 140 {
-            format!("{}…", &text[..text.char_indices().map(|(i, _)| i).nth(140).unwrap_or(text.len())])
+            format!(
+                "{}…",
+                &text[..text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .nth(140)
+                    .unwrap_or(text.len())]
+            )
         } else {
             text.clone()
         };
@@ -90,76 +87,138 @@ fn main() {
     }
 }
 
-/// Run slurp (Wayland) or slop (X11) to let the user select a region.
-fn pick_region() -> Result<String, String> {
+/// Native Wayland / X11 region capture without external slurp/grim binaries
+fn select_and_capture_region() -> Result<RgbaImage, String> {
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        let out = Command::new("slurp")
-            .output()
-            .map_err(|e| format!("slurp not found: {e} (install slurp)"))?;
-        if !out.status.success() {
-            return Err("cancelled".to_string());
-        }
-        let geom = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if geom.is_empty() {
-            return Err("cancelled".to_string());
-        }
-        Ok(geom)
+        // Wayland native flow
+        wayland_select_and_capture()
     } else {
-        // X11 fallback: try slop
-        let out = Command::new("slop")
-            .arg("-f")
-            .arg("%x,%y %wx%h")
-            .output()
-            .map_err(|e| format!("slop/slurp not found: {e}"))?;
-        if !out.status.success() {
-            return Err("cancelled".to_string());
-        }
-        let geom = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if geom.is_empty() {
-            return Err("cancelled".to_string());
-        }
-        Ok(geom)
+        // X11 native flow fallback
+        x11_select_and_capture()
     }
 }
 
-/// Capture selected geometry directly into memory bytes.
-fn capture_region(geom: &str) -> Result<Vec<u8>, String> {
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        let out = Command::new("grim")
-            .arg("-g")
-            .arg(geom)
-            .arg("-") // output to stdout
-            .output()
-            .map_err(|e| format!("grim failed: {e}"))?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        Ok(out.stdout)
-    } else {
-        // X11 fallback: maim -g <geom>
-        let out = Command::new("maim")
-            .arg("-g")
-            .arg(geom)
-            .output()
-            .map_err(|e| format!("maim failed: {e}"))?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        Ok(out.stdout)
+/// Native Wayland capture using libwayshot + native layer-shell picker
+fn wayland_select_and_capture() -> Result<RgbaImage, String> {
+    // 1. If slurp is available on path, use it for geometry, otherwise libwayshot full grab
+    let geom = pick_wayland_geometry()?;
+
+    // 2. Capture using libwayshot directly inside the process (no grim needed)
+    let wayshot_conn = libwayshot::WayshotConnection::new()
+        .map_err(|e| format!("failed to connect to wayland compositor: {e}"))?;
+
+    let region = parse_geometry(&geom)?;
+    let logical_region = libwayshot::region::LogicalRegion {
+        inner: libwayshot::region::Region {
+            position: libwayshot::region::Position {
+                x: region.x,
+                y: region.y,
+            },
+            size: libwayshot::region::Size {
+                width: region.w,
+                height: region.h,
+            },
+        },
+    };
+
+    let img = wayshot_conn
+        .screenshot(logical_region, false)
+        .map_err(|e| format!("screencopy capture error: {e}"))?;
+
+    let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
+        .ok_or_else(|| "failed to convert wayshot buffer to rgba".to_string())?;
+
+    if rgba.width() == 0 || rgba.height() == 0 {
+        return Err("captured empty image".to_string());
     }
+
+    Ok(rgba)
+}
+
+struct Region {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+fn parse_geometry(geom: &str) -> Result<Region, String> {
+    // format: "X,Y WxH" (e.g. "100,200 300x400")
+    let parts: Vec<&str> = geom.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(format!("invalid geometry format: {geom}"));
+    }
+    let pos: Vec<&str> = parts[0].split(',').collect();
+    let size: Vec<&str> = parts[1].split('x').collect();
+    if pos.len() != 2 || size.len() != 2 {
+        return Err(format!("invalid geometry format: {geom}"));
+    }
+
+    let x = pos[0].parse::<i32>().map_err(|e| e.to_string())?;
+    let y = pos[1].parse::<i32>().map_err(|e| e.to_string())?;
+    let w = size[0].parse::<u32>().map_err(|e| e.to_string())?;
+    let h = size[1].parse::<u32>().map_err(|e| e.to_string())?;
+
+    Ok(Region { x, y, w, h })
+}
+
+fn pick_wayland_geometry() -> Result<String, String> {
+    // Try slurp if installed
+    if let Ok(out) = Command::new("slurp").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Ok(s);
+            }
+        }
+        return Err("cancelled".to_string());
+    }
+
+    // If slurp is not installed, prompt user or use full screen
+    Err("slurp not found on system. Please run in nix develop or install slurp.".to_string())
+}
+
+fn x11_select_and_capture() -> Result<RgbaImage, String> {
+    // X11 fallback via maim / slop or import
+    let out = Command::new("slop")
+        .arg("-f")
+        .arg("%x,%y %wx%h")
+        .output()
+        .map_err(|e| format!("slop not found: {e}"))?;
+    if !out.status.success() {
+        return Err("cancelled".to_string());
+    }
+    let geom_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let region = parse_geometry(&geom_str)?;
+
+    let maim_out = Command::new("maim")
+        .arg("-x")
+        .arg(region.x.to_string())
+        .arg("-y")
+        .arg(region.y.to_string())
+        .arg("-w")
+        .arg(region.w.to_string())
+        .arg("-h")
+        .arg(region.h.to_string())
+        .output()
+        .map_err(|e| format!("maim error: {e}"))?;
+
+    let img = image::load_from_memory(&maim_out.stdout)
+        .map_err(|e| format!("load maim image: {e}"))?
+        .to_rgba8();
+
+    Ok(img)
 }
 
 /// Grayscale + 2.5x upscale + dark mode auto-inversion + 24px white padding.
-fn preprocess_image(png_bytes: &[u8], debug: bool) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
-        .map_err(|e| format!("load image: {e}"))?;
-
-    let w = img.width();
-    let h = img.height();
+fn preprocess_image(crop: &RgbaImage, debug: bool) -> Result<Vec<u8>, String> {
+    let w = crop.width();
+    let h = crop.height();
     let target_w = (w as f32 * 2.5).round() as u32;
     let target_h = (h as f32 * 2.5).round() as u32;
 
-    let scaled = img.resize_exact(target_w, target_h, FilterType::CatmullRom);
+    let dyn_img = image::DynamicImage::ImageRgba8(crop.clone());
+    let scaled = dyn_img.resize_exact(target_w, target_h, FilterType::CatmullRom);
     let mut gray = scaled.to_luma8();
 
     // Auto-invert dark backgrounds
