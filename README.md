@@ -1,20 +1,86 @@
 # snapocr
 
-Select a region of the screen, OCR the text in it, copy to clipboard.
+A lightning-fast, self-contained screen OCR utility for Linux desktops (Wayland & X11).
+
+Select any region on your screen, extract text (English, Arabic, code, symbols) using an optimized in-memory Tesseract pipeline, and copy the result directly to your clipboard with a native desktop notification.
+
+Zero external CLI dependencies required (no `slurp`, no `grim`).
+
+---
+
+## Features
+
+- ⚡ **Instant & Self-Contained:** Native in-memory Wayland screencopy via `libwayshot` + interactive freeze-frame selector.
+- 🌍 **Auto Multi-Language OCR:** Detects and extracts Arabic and English text simultaneously (`eng+ara`) out-of-the-box.
+- 🎯 **High-Accuracy OCR Pipeline:**
+  - 2.5× Catmull-Rom upscaling to match 300 DPI neural OCR requirements.
+  - 24px white padding to preserve character connectors & glyph contours.
+  - Automatic dark-mode background detection & inversion.
+  - Intelligent Page Segmentation Mode (PSM) fallback (PSM 13 for single-line UI titles/snippets, PSM 6 for multiline blocks).
+- 📋 **Seamless Clipboard & Alerts:** Copies to clipboard (`arboard` / `wl-copy`) and delivers a native desktop notification preview (`notify-send`).
+- ❄️ **Nix Flake First-Class Support:** Zero-friction build and dev environment with pinned dependencies.
+
+---
 
 ## Usage
 
 ```bash
-nix develop            # dev shell (rust, tesseract, test rig)
-cargo build --release
-./target/release/snapocr            # default language: eng
-./target/release/snapocr --lang ara # arabic
-./target/release/snapocr --debug    # keep the cropped png in /tmp
+# Default: interactive crop with automatic language detection (English + Arabic)
+snapocr
+
+# Force a specific language
+snapocr --lang eng
+snapocr --lang ara
+
+# Save preprocessed crop to /tmp for debugging
+snapocr --debug
+
+# Suppress desktop notification
+snapocr --no-notify
 ```
 
-Or install: `nix run .#` (wraps tesseract + runtime libs).
+---
 
-- X11 / Xwayland: native XCB grab.
-- Wayland: XDG Desktop Portal screenshot (works on any compositor).
-- Drag to select, release to OCR, text lands in the clipboard, auto-exits.
-- Esc quits anytime.
+## Hyprland / Sway Keybind
+
+Add this to your `hyprland.conf`:
+
+```ini
+# OCR region to clipboard
+bind = $mainMod SHIFT, S, exec, snapocr
+```
+
+Or in `sway/config`:
+
+```ini
+bindsym $mod+Shift+s exec snapocr
+```
+
+---
+
+## Building & Installation
+
+### With Nix Flakes (Recommended)
+
+```bash
+# Build the standalone wrapped binary
+nix build .#
+
+# Run directly
+./result/bin/snapocr
+
+# Enter development shell
+nix develop
+```
+
+### With Cargo
+
+```bash
+cargo build --release
+```
+
+---
+
+## License
+
+MIT
