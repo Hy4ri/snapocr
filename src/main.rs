@@ -1,165 +1,223 @@
-// snapocr — select a screen region, OCR it, copy to clipboard.
-// Wayland: grim for screenshot (works on Hyprland, Sway, etc.)
-// X11/Xwayland: xcap native XCB grab.
+// snapocr — ultra-lean screen OCR to clipboard
+// Wayland: slurp + grim
+// X11: slop + maim (or xdotool/import fallback)
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use eframe::egui::{
-    self, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, ScrollArea, Sense,
-    Stroke, StrokeKind, Vec2,
-};
-use image::{imageops::FilterType, GrayImage, ImageFormat, Luma, RgbaImage};
+use image::{imageops::FilterType, GrayImage, ImageFormat, Luma};
 
-const MIN_SEL: f32 = 6.0;
-const AUTO_CLOSE: Duration = Duration::from_millis(2800);
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let lang = args
+        .windows(2)
+        .find(|w| w[0] == "--lang")
+        .map(|w| w[1].clone())
+        .unwrap_or_else(|| "auto".to_string());
+    let debug = args.iter().any(|a| a == "--debug");
+    let no_notify = args.iter().any(|a| a == "--no-notify");
 
-enum Stage {
-    Ready,
-    Ocr(Option<JoinHandle<Result<String, String>>>),
-    Done { at: Instant, text: String },
-    Fail { at: Instant, msg: String },
-}
-
-struct SnapApp {
-    raw: RgbaImage,
-    tex: egui::TextureHandle,
-    start: Option<Pos2>,
-    cur: Option<Pos2>,
-    stage: Stage,
-    lang: String,
-    debug: bool,
-}
-
-impl SnapApp {
-    fn begin_ocr(&mut self, sel: Rect) {
-        let x = (sel.min.x.max(0.0) as u32).min(self.raw.width().saturating_sub(1));
-        let y = (sel.min.y.max(0.0) as u32).min(self.raw.height().saturating_sub(1));
-        let w = (sel.width() as u32).clamp(1, self.raw.width().saturating_sub(x));
-        let h = (sel.height() as u32).clamp(1, self.raw.height().saturating_sub(y));
-
-        let crop = image::imageops::crop_imm(&self.raw, x, y, w, h).to_image();
-        let lang = self.lang.clone();
-        let debug = self.debug;
-
-        self.stage = Stage::Ocr(Some(std::thread::spawn(move || {
-            // Preprocessing:
-            // 1. Convert to grayscale & upscale 2.5x
-            let dyn_img = image::DynamicImage::ImageRgba8(crop);
-            let target_w = (w as f32 * 2.5).round() as u32;
-            let target_h = (h as f32 * 2.5).round() as u32;
-            let scaled = dyn_img.resize_exact(target_w, target_h, FilterType::CatmullRom);
-            let mut gray = scaled.to_luma8();
-
-            // 2. Detect dark-mode background and invert to black-on-white
-            let mut border_sum: u64 = 0;
-            let mut border_count: u64 = 0;
-            let gw = gray.width();
-            let gh = gray.height();
-            for gx in 0..gw {
-                border_sum += gray.get_pixel(gx, 0)[0] as u64;
-                border_sum += gray.get_pixel(gx, gh - 1)[0] as u64;
-                border_count += 2;
+    // 1. Pick region interactively
+    let geom = match pick_region() {
+        Ok(g) => g,
+        Err(e) => {
+            // User cancelled or slurp exited with non-zero (e.g. pressed Escape)
+            if !e.is_empty() && e != "cancelled" {
+                eprintln!("snapocr: {e}");
             }
-            for gy in 1..gh - 1 {
-                border_sum += gray.get_pixel(0, gy)[0] as u64;
-                border_sum += gray.get_pixel(gw - 1, gy)[0] as u64;
-                border_count += 2;
-            }
-            let avg_border_luma = (border_sum / border_count.max(1)) as u8;
-            if avg_border_luma < 128 {
-                for p in gray.pixels_mut() {
-                    p[0] = 255 - p[0];
-                }
-            }
-
-            // 3. Add clean white border padding around crop
-            let pad = 24u32;
-            let padded_w = gw + pad * 2;
-            let padded_h = gh + pad * 2;
-            let mut padded_img = GrayImage::from_pixel(padded_w, padded_h, Luma([255]));
-            image::imageops::overlay(&mut padded_img, &gray, pad as i64, pad as i64);
-
-            let mut ppm_bytes = Vec::with_capacity((padded_w * padded_h + 64) as usize);
-            padded_img
-                .write_to(
-                    &mut std::io::Cursor::new(&mut ppm_bytes),
-                    ImageFormat::Pnm,
-                )
-                .map_err(|e| format!("ppm encode error: {e}"))?;
-
-            if debug {
-                let png_path =
-                    std::env::temp_dir().join(format!("snapocr-{}.png", std::process::id()));
-                let _ = padded_img.save(&png_path);
-            }
-
-            let resolved_lang = if lang == "auto" || lang.is_empty() {
-                detect_available_langs().unwrap_or_else(|| "eng+ara".to_string())
-            } else {
-                lang
-            };
-
-            // Multi-strategy OCR:
-            // 1. Try PSM 6 (uniform block of text / multiline)
-            // 2. Try PSM 13 (raw single line / UI text snippets — vital for short Arabic/English lines)
-            // 3. Try PSM 3 (fully automatic page segmentation fallback)
-            let mut text = run_tesseract(&ppm_bytes, &resolved_lang, "6").unwrap_or_default();
-            if text.is_empty() {
-                text = run_tesseract(&ppm_bytes, &resolved_lang, "13").unwrap_or_default();
-            }
-            if text.is_empty() {
-                text = run_tesseract(&ppm_bytes, &resolved_lang, "3").unwrap_or_default();
-            }
-
-            if text.is_empty() {
-                return Err("No text detected in region".to_string());
-            }
-            Ok(text)
-        })));
-    }
-
-    fn poll_ocr(&mut self) {
-        if let Stage::Ocr(ref mut opt) = self.stage {
-            if opt.as_ref().map_or(false, |h| h.is_finished()) {
-                if let Some(handle) = opt.take() {
-                    let res = handle
-                        .join()
-                        .unwrap_or_else(|_| Err("ocr thread panicked".to_string()));
-                    self.stage = match res {
-                        Ok(text) => {
-                            match Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
-                                Ok(_) => Stage::Done {
-                                    at: Instant::now(),
-                                    text,
-                                },
-                                Err(e) => Stage::Fail {
-                                    at: Instant::now(),
-                                    msg: format!("clipboard: {e}"),
-                                },
-                            }
-                        }
-                        Err(msg) => Stage::Fail {
-                            at: Instant::now(),
-                            msg,
-                        },
-                    };
-                }
-            }
+            std::process::exit(0);
         }
+    };
+
+    // 2. Capture the selected region to PNG in memory
+    let png_bytes = match capture_region(&geom) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("snapocr capture failed: {e}");
+            notify_err(&format!("Capture failed: {e}"), no_notify);
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Preprocess for OCR in memory
+    let ppm_bytes = match preprocess_image(&png_bytes, debug) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("snapocr preprocess failed: {e}");
+            notify_err(&format!("Preprocess failed: {e}"), no_notify);
+            std::process::exit(1);
+        }
+    };
+
+    // 4. Resolve languages & run Tesseract
+    let resolved_lang = if lang == "auto" || lang.is_empty() {
+        detect_available_langs().unwrap_or_else(|| "eng+ara".to_string())
+    } else {
+        lang
+    };
+
+    let text = match ocr_pipeline(&ppm_bytes, &resolved_lang) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("snapocr: {e}");
+            notify_err(&e, no_notify);
+            std::process::exit(1);
+        }
+    };
+
+    // 5. Copy to clipboard
+    if let Err(e) = copy_to_clipboard(&text) {
+        eprintln!("snapocr: clipboard error: {e}");
     }
 
-    fn maybe_auto_close(&self, ctx: &egui::Context) {
-        let close = match &self.stage {
-            Stage::Done { at, .. } | Stage::Fail { at, .. } => at.elapsed() > AUTO_CLOSE,
-            _ => false,
+    println!("{text}");
+
+    // 6. Native desktop notification
+    if !no_notify {
+        let preview = if text.len() > 140 {
+            format!("{}…", &text[..text.char_indices().map(|(i, _)| i).nth(140).unwrap_or(text.len())])
+        } else {
+            text.clone()
         };
-        if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        let _ = Command::new("notify-send")
+            .arg("-a")
+            .arg("snapocr")
+            .arg("-i")
+            .arg("edit-copy")
+            .arg("Copied to clipboard")
+            .arg(&preview)
+            .status();
+    }
+}
+
+/// Run slurp (Wayland) or slop (X11) to let the user select a region.
+fn pick_region() -> Result<String, String> {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        let out = Command::new("slurp")
+            .output()
+            .map_err(|e| format!("slurp not found: {e} (install slurp)"))?;
+        if !out.status.success() {
+            return Err("cancelled".to_string());
+        }
+        let geom = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if geom.is_empty() {
+            return Err("cancelled".to_string());
+        }
+        Ok(geom)
+    } else {
+        // X11 fallback: try slop
+        let out = Command::new("slop")
+            .arg("-f")
+            .arg("%x,%y %wx%h")
+            .output()
+            .map_err(|e| format!("slop/slurp not found: {e}"))?;
+        if !out.status.success() {
+            return Err("cancelled".to_string());
+        }
+        let geom = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if geom.is_empty() {
+            return Err("cancelled".to_string());
+        }
+        Ok(geom)
+    }
+}
+
+/// Capture selected geometry directly into memory bytes.
+fn capture_region(geom: &str) -> Result<Vec<u8>, String> {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        let out = Command::new("grim")
+            .arg("-g")
+            .arg(geom)
+            .arg("-") // output to stdout
+            .output()
+            .map_err(|e| format!("grim failed: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(out.stdout)
+    } else {
+        // X11 fallback: maim -g <geom>
+        let out = Command::new("maim")
+            .arg("-g")
+            .arg(geom)
+            .output()
+            .map_err(|e| format!("maim failed: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// Grayscale + 2.5x upscale + dark mode auto-inversion + 24px white padding.
+fn preprocess_image(png_bytes: &[u8], debug: bool) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
+        .map_err(|e| format!("load image: {e}"))?;
+
+    let w = img.width();
+    let h = img.height();
+    let target_w = (w as f32 * 2.5).round() as u32;
+    let target_h = (h as f32 * 2.5).round() as u32;
+
+    let scaled = img.resize_exact(target_w, target_h, FilterType::CatmullRom);
+    let mut gray = scaled.to_luma8();
+
+    // Auto-invert dark backgrounds
+    let mut border_sum: u64 = 0;
+    let mut border_count: u64 = 0;
+    let gw = gray.width();
+    let gh = gray.height();
+    for gx in 0..gw {
+        border_sum += gray.get_pixel(gx, 0)[0] as u64;
+        border_sum += gray.get_pixel(gx, gh - 1)[0] as u64;
+        border_count += 2;
+    }
+    for gy in 1..gh - 1 {
+        border_sum += gray.get_pixel(0, gy)[0] as u64;
+        border_sum += gray.get_pixel(gw - 1, gy)[0] as u64;
+        border_count += 2;
+    }
+    let avg_border_luma = (border_sum / border_count.max(1)) as u8;
+    if avg_border_luma < 128 {
+        for p in gray.pixels_mut() {
+            p[0] = 255 - p[0];
         }
     }
+
+    // 24px border padding
+    let pad = 24u32;
+    let padded_w = gw + pad * 2;
+    let padded_h = gh + pad * 2;
+    let mut padded_img = GrayImage::from_pixel(padded_w, padded_h, Luma([255]));
+    image::imageops::overlay(&mut padded_img, &gray, pad as i64, pad as i64);
+
+    let mut ppm_bytes = Vec::with_capacity((padded_w * padded_h + 64) as usize);
+    padded_img
+        .write_to(&mut std::io::Cursor::new(&mut ppm_bytes), ImageFormat::Pnm)
+        .map_err(|e| format!("ppm encode error: {e}"))?;
+
+    if debug {
+        let debug_path = std::env::temp_dir().join(format!("snapocr-{}.png", std::process::id()));
+        let _ = padded_img.save(&debug_path);
+        eprintln!("snapocr: saved debug preprocessed image to {:?}", debug_path);
+    }
+
+    Ok(ppm_bytes)
+}
+
+/// Cascade OCR: PSM 6 -> PSM 13 -> PSM 3.
+fn ocr_pipeline(ppm_bytes: &[u8], lang: &str) -> Result<String, String> {
+    let mut text = run_tesseract(ppm_bytes, lang, "6").unwrap_or_default();
+    if text.is_empty() {
+        text = run_tesseract(ppm_bytes, lang, "13").unwrap_or_default();
+    }
+    if text.is_empty() {
+        text = run_tesseract(ppm_bytes, lang, "3").unwrap_or_default();
+    }
+    if text.is_empty() {
+        return Err("No text detected in region".to_string());
+    }
+    Ok(text)
 }
 
 fn run_tesseract(ppm_bytes: &[u8], lang: &str, psm: &str) -> Result<String, String> {
@@ -196,7 +254,37 @@ fn run_tesseract(ppm_bytes: &[u8], lang: &str, psm: &str) -> Result<String, Stri
     Ok(text)
 }
 
-/// Discovers installed Tesseract language models (e.g. "eng+ara")
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    // Try arboard first
+    if let Ok(mut cb) = Clipboard::new() {
+        if cb.set_text(text.to_string()).is_ok() {
+            return Ok(());
+        }
+    }
+    // Fallback: wl-copy
+    if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+    // Fallback: xclip
+    if let Ok(mut child) = Command::new("xclip")
+        .arg("-selection")
+        .arg("clipboard")
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+    Err("Failed to access clipboard".to_string())
+}
+
 fn detect_available_langs() -> Option<String> {
     let out = Command::new("tesseract").arg("--list-langs").output().ok()?;
     if !out.status.success() {
@@ -232,309 +320,15 @@ fn detect_available_langs() -> Option<String> {
     }
 }
 
-impl eframe::App for SnapApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.poll_ocr();
-        self.maybe_auto_close(&ctx);
-
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        let mut ocr_sel: Option<Rect> = None;
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| {
-                ScrollArea::both().show(ui, |ui| {
-                    let resp = ui.add(Image::new(&self.tex).sense(Sense::drag()));
-                    let origin = resp.rect.min;
-
-                    if resp.drag_started() {
-                        self.start = resp
-                            .interact_pointer_pos()
-                            .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
-                        self.cur = self.start;
-                    }
-                    if resp.dragged() {
-                        self.cur = resp
-                            .interact_pointer_pos()
-                            .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
-                    }
-                    if resp.drag_stopped() {
-                        if let (Some(s), Some(c)) = (self.start, self.cur) {
-                            let r = Rect::from_two_pos(s, c);
-                            if r.width() >= MIN_SEL && r.height() >= MIN_SEL {
-                                ocr_sel = Some(r);
-                            }
-                        }
-                        self.start = None;
-                        self.cur = None;
-                    }
-
-                    // draw selection overlay
-                    if let (Some(s), Some(c)) = (self.start, self.cur) {
-                        let a = Pos2::new(origin.x + s.x, origin.y + s.y);
-                        let b = Pos2::new(origin.x + c.x, origin.y + c.y);
-                        let r = Rect::from_two_pos(a, b);
-                        let painter = ui.painter();
-                        let dim = Color32::from_black_alpha(115);
-                        let img_w = self.raw.width() as f32;
-                        let img_h = self.raw.height() as f32;
-
-                        // dim everything outside the selection (4 rects)
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, origin.y),
-                                Pos2::new(origin.x + img_w, r.min.y.max(origin.y)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, r.max.y.min(origin.y + img_h)),
-                                Pos2::new(origin.x + img_w, origin.y + img_h),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(origin.x, r.min.y.max(origin.y)),
-                                Pos2::new(r.min.x.max(origin.x), r.max.y.min(origin.y + img_h)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(r.max.x.min(origin.x + img_w), r.min.y.max(origin.y)),
-                                Pos2::new(origin.x + img_w, r.max.y.min(origin.y + img_h)),
-                            ),
-                            0.0,
-                            dim,
-                        );
-
-                        // selection border
-                        painter.rect_stroke(
-                            r,
-                            0.0,
-                            Stroke::new(2.0, Color32::from_rgb(255, 75, 75)),
-                            StrokeKind::Outside,
-                        );
-
-                        // size label tooltip
-                        painter.text(
-                            r.min + Vec2::new(4.0, -18.0),
-                            Align2::LEFT_BOTTOM,
-                            format!("{}×{}", r.width() as u32, r.height() as u32),
-                            FontId::monospace(13.0),
-                            Color32::WHITE,
-                        );
-                    }
-                });
-            });
-
-        if let Some(r) = ocr_sel {
-            self.begin_ocr(r);
-        }
-
-        // Modern adaptive bottom notification bar
-        let screen_rect = ctx.content_rect();
-        let max_card_w = (screen_rect.width() * 0.7).clamp(320.0, 720.0);
-
-        egui::Area::new(egui::Id::new("bottom_status_bar"))
-            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -28.0))
-            .show(&ctx, |ui| {
-                let bg_frame = egui::Frame::NONE
-                    .fill(Color32::from_rgba_premultiplied(18, 18, 24, 235))
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 65)))
-                    .inner_margin(egui::Margin::symmetric(16, 12));
-
-                bg_frame.show(ui, |ui| {
-                    ui.set_max_width(max_card_w);
-                    match &self.stage {
-                        Stage::Ready => {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("✂")
-                                        .size(15.0)
-                                        .color(Color32::from_rgb(180, 180, 200)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Drag to select area  •  Esc to cancel")
-                                        .size(13.5)
-                                        .color(Color32::from_rgb(220, 220, 230)),
-                                );
-                            });
-                        }
-                        Stage::Ocr(_) => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(
-                                    egui::RichText::new("Recognizing text...")
-                                        .size(14.0)
-                                        .color(Color32::from_rgb(200, 210, 255)),
-                                );
-                            });
-                        }
-                        Stage::Done { text, .. } => {
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("✓ Copied to clipboard")
-                                            .size(13.5)
-                                            .strong()
-                                            .color(Color32::from_rgb(90, 225, 140)),
-                                    );
-                                });
-                                ui.add_space(4.0);
-                                egui::Frame::NONE
-                                    .fill(Color32::from_rgba_premultiplied(10, 10, 15, 200))
-                                    .corner_radius(CornerRadius::same(6))
-                                    .inner_margin(egui::Margin::symmetric(10, 8))
-                                    .show(ui, |ui| {
-                                        ScrollArea::vertical()
-                                            .max_height(140.0)
-                                            .auto_shrink([false, true])
-                                            .show(ui, |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(text)
-                                                            .monospace()
-                                                            .size(12.5)
-                                                            .color(Color32::from_rgb(
-                                                                240, 240, 245,
-                                                            )),
-                                                    )
-                                                    .wrap(),
-                                                );
-                                            });
-                                    });
-                            });
-                        }
-                        Stage::Fail { msg, .. } => {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("✗")
-                                        .size(15.0)
-                                        .color(Color32::from_rgb(255, 95, 95)),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(msg)
-                                            .size(13.5)
-                                            .color(Color32::from_rgb(255, 150, 150)),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                        }
-                    }
-                });
-            });
+fn notify_err(msg: &str, no_notify: bool) {
+    if !no_notify {
+        let _ = Command::new("notify-send")
+            .arg("-a")
+            .arg("snapocr")
+            .arg("-u")
+            .arg("critical")
+            .arg("OCR Failed")
+            .arg(msg)
+            .status();
     }
-}
-
-/// Capture the screen. Wayland: grim → file → load. X11: xcap native.
-fn capture_screen() -> Result<RgbaImage, String> {
-    // try grim first (wayland - works on hyprland, sway, etc.)
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        let tmp = std::env::temp_dir().join(format!("snapocr-grab-{}.png", std::process::id()));
-        let out = Command::new("grim").arg(&tmp).output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let img = image::open(&tmp)
-                    .map_err(|e| format!("load grim output: {e}"))?
-                    .to_rgba8();
-                let _ = std::fs::remove_file(&tmp);
-                if img.width() > 0 && img.height() > 0 {
-                    return Ok(img);
-                }
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!("snapocr: grim failed: {}", stderr.trim());
-            }
-            Err(e) => {
-                eprintln!("snapocr: grim not found ({e}), trying xcap...");
-            }
-        }
-    }
-
-    // fallback: xcap (works on X11/Xwayland)
-    let monitors = xcap::Monitor::all().map_err(|e| format!("xcap monitors: {e}"))?;
-    let monitor = monitors
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no monitors found".to_string())?;
-    let raw = monitor
-        .capture_image()
-        .map_err(|e| format!("xcap capture: {e}"))?;
-    if raw.width() == 0 || raw.height() == 0 {
-        return Err("captured empty image".to_string());
-    }
-    Ok(raw)
-}
-
-fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let lang = args
-        .windows(2)
-        .find(|w| w[0] == "--lang")
-        .map(|w| w[1].clone())
-        .unwrap_or_else(|| "auto".to_string());
-    let debug = args.iter().any(|a| a == "--debug");
-
-    let raw = match capture_screen() {
-        Ok(img) => img,
-        Err(e) => {
-            eprintln!("snapocr: {e}");
-            eprintln!("  wayland: install grim (nix-shell -p grim)");
-            eprintln!("  x11: make sure DISPLAY is set");
-            std::process::exit(1);
-        }
-    };
-
-    let w = raw.width() as f32;
-    let h = raw.height() as f32;
-
-    // Viewport configured for true borderless fullscreen snapshot experience
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([w, h])
-        .with_fullscreen(true)
-        .with_decorations(false)
-        .with_always_on_top()
-        .with_active(true)
-        .with_title("snapocr");
-
-    eframe::run_native(
-        "snapocr",
-        eframe::NativeOptions {
-            viewport,
-            ..Default::default()
-        },
-        Box::new(move |cc| {
-            let color = ColorImage::from_rgba_unmultiplied(
-                [raw.width() as usize, raw.height() as usize],
-                raw.as_raw(),
-            );
-            let tex = cc
-                .egui_ctx
-                .load_texture("screen", color, egui::TextureOptions::NEAREST);
-            Ok(Box::new(SnapApp {
-                raw,
-                tex,
-                start: None,
-                cur: None,
-                stage: Stage::Ready,
-                lang,
-                debug,
-            }))
-        }),
-    )
 }

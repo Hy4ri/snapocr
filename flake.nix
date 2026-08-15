@@ -1,5 +1,5 @@
 {
-  description = "snapocr — select a screen region, OCR it, copy to clipboard";
+  description = "snapocr — lean & fast screen OCR to clipboard for Wayland & X11";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -11,8 +11,6 @@
 
       tesseractFull = pkgs:
         pkgs.tesseract.override { enableLanguages = [ "eng" "ara" "osd" ]; };
-
-      runtimeLibs = pkgs: with pkgs; [ libGL libxkbcommon wayland libxcb libgbm ];
     in
     {
       devShells = forAllSystems (pkgs: {
@@ -22,47 +20,24 @@
             cargo
             pkg-config
             (tesseractFull pkgs)
-            # x11/wayland libs for eframe + xcap
-            libxcb
-            xcb-proto
-            libxkbcommon
-            wayland
-            libGL
-            fontconfig
-            dejavu_fonts
-            # xcap wayland capture backend (pipewire + gbm)
-            pipewire
-            libgbm
-            # grim for wayland screenshot (hyprland, sway, etc.)
             grim
-            # pipewire-sys bindgen needs libclang
-            clang
-            libclang.lib
-            # headless test rig
-            xvfb-run
-            xdotool
-            feh
-            xclip
-            imagemagick
+            slurp
+            libnotify
+            wl-clipboard
           ];
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (runtimeLibs pkgs);
-          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
         };
       });
 
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "snapocr";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper clang libclang.lib ];
-          buildInputs = with pkgs; [ libxcb xcb-proto libxkbcommon wayland libGL pipewire libgbm ];
-          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
           postInstall = ''
             wrapProgram $out/bin/snapocr \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.grim ]} \
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.grim pkgs.slurp pkgs.libnotify pkgs.wl-clipboard ]}
           '';
         };
       });
