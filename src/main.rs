@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, ScrollArea, Sense,
     Stroke, StrokeKind, Vec2,
 };
-use image::{imageops::FilterType, ImageFormat, RgbaImage};
+use image::{imageops::FilterType, GrayImage, ImageFormat, Luma, RgbaImage};
 
 const MIN_SEL: f32 = 6.0;
 const AUTO_CLOSE: Duration = Duration::from_millis(2800);
@@ -45,61 +45,70 @@ impl SnapApp {
         let debug = self.debug;
 
         self.stage = Stage::Ocr(Some(std::thread::spawn(move || {
-            // Screen fonts are low resolution (96 DPI). Tesseract expects ~300 DPI.
-            // Upscaling 2.5x with Lanczos/CatmullRom + grayscale turns small blurry UI glyphs into crisp characters.
+            // Preprocessing:
+            // 1. Convert to grayscale & upscale 2.5x
             let dyn_img = image::DynamicImage::ImageRgba8(crop);
             let target_w = (w as f32 * 2.5).round() as u32;
             let target_h = (h as f32 * 2.5).round() as u32;
-
             let scaled = dyn_img.resize_exact(target_w, target_h, FilterType::CatmullRom);
-            let gray = scaled.to_luma8();
+            let mut gray = scaled.to_luma8();
 
-            let mut ppm_bytes = Vec::with_capacity((target_w * target_h + 64) as usize);
-            gray.write_to(
-                &mut std::io::Cursor::new(&mut ppm_bytes),
-                ImageFormat::Pnm,
-            )
-            .map_err(|e| format!("ppm encode error: {e}"))?;
+            // 2. Detect dark-mode background and invert to black-on-white
+            // Sample the outer border pixels to estimate background luminance
+            let mut border_sum: u64 = 0;
+            let mut border_count: u64 = 0;
+            let gw = gray.width();
+            let gh = gray.height();
+            for gx in 0..gw {
+                border_sum += gray.get_pixel(gx, 0)[0] as u64;
+                border_sum += gray.get_pixel(gx, gh - 1)[0] as u64;
+                border_count += 2;
+            }
+            for gy in 1..gh - 1 {
+                border_sum += gray.get_pixel(0, gy)[0] as u64;
+                border_sum += gray.get_pixel(gw - 1, gy)[0] as u64;
+                border_count += 2;
+            }
+            let avg_border_luma = (border_sum / border_count.max(1)) as u8;
+            if avg_border_luma < 128 {
+                // Invert dark background so text is dark on light background
+                for p in gray.pixels_mut() {
+                    p[0] = 255 - p[0];
+                }
+            }
+
+            // 3. Add a generous white border (padding) around the cropped text.
+            // Tesseract character segmentation severely degrades if letters touch the crop boundary.
+            let pad = 24u32;
+            let padded_w = gw + pad * 2;
+            let padded_h = gh + pad * 2;
+            let mut padded_img = GrayImage::from_pixel(padded_w, padded_h, Luma([255]));
+            image::imageops::overlay(&mut padded_img, &gray, pad as i64, pad as i64);
+
+            let mut ppm_bytes = Vec::with_capacity((padded_w * padded_h + 64) as usize);
+            padded_img
+                .write_to(
+                    &mut std::io::Cursor::new(&mut ppm_bytes),
+                    ImageFormat::Pnm,
+                )
+                .map_err(|e| format!("ppm encode error: {e}"))?;
 
             if debug {
                 let png_path =
                     std::env::temp_dir().join(format!("snapocr-{}.png", std::process::id()));
-                let _ = gray.save(&png_path);
+                let _ = padded_img.save(&png_path);
             }
 
-            // Run tesseract with PSM 3 (auto page segmentation) or PSM 11 (sparse text).
-            // dpi 300 hint tells tesseract how to interpret character scale.
-            let mut child = Command::new("tesseract")
-                .arg("stdin")
-                .arg("stdout")
-                .arg("-l")
-                .arg(&lang)
-                .arg("--psm")
-                .arg("3")
-                .arg("--dpi")
-                .arg("300")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("failed to spawn tesseract: {e}"))?;
+            let resolved_lang = if lang == "auto" || lang.is_empty() {
+                detect_available_langs().unwrap_or_else(|| "ara+eng".to_string())
+            } else {
+                lang
+            };
 
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(&ppm_bytes)
-                    .map_err(|e| format!("failed to write image to tesseract stdin: {e}"))?;
-            }
+            // Try primary pass with PSM 6 (uniform block of text), fallback to PSM 3 (auto) if needed
+            let text = run_tesseract(&ppm_bytes, &resolved_lang, "6")
+                .or_else(|_| run_tesseract(&ppm_bytes, &resolved_lang, "3"))?;
 
-            let out = child
-                .wait_with_output()
-                .map_err(|e| format!("tesseract failed while waiting: {e}"))?;
-
-            if !out.status.success() {
-                let msg = String::from_utf8_lossy(&out.stderr);
-                return Err(format!("tesseract failed: {}", msg.trim()));
-            }
-
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if text.is_empty() {
                 return Err("No text detected in region".to_string());
             }
@@ -145,6 +154,81 @@ impl SnapApp {
         if close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+}
+
+fn run_tesseract(ppm_bytes: &[u8], lang: &str, psm: &str) -> Result<String, String> {
+    let mut child = Command::new("tesseract")
+        .arg("stdin")
+        .arg("stdout")
+        .arg("-l")
+        .arg(lang)
+        .arg("--psm")
+        .arg(psm)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn tesseract: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(ppm_bytes);
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("tesseract failed while waiting: {e}"))?;
+
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("tesseract error: {}", msg.trim()));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err("empty result".to_string());
+    }
+    Ok(text)
+}
+
+/// Discovers installed Tesseract language models with Arabic script priority (e.g. "ara+eng")
+fn detect_available_langs() -> Option<String> {
+    let out = Command::new("tesseract").arg("--list-langs").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut langs = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("List of")
+            || line.contains('/')
+            || line.contains('\\')
+            || line == "osd"
+        {
+            continue;
+        }
+        langs.push(line.to_string());
+    }
+    if langs.is_empty() {
+        None
+    } else {
+        // Prioritize Arabic script first, then English, then alphabetical
+        langs.sort_by(|a, b| {
+            if a == "ara" {
+                std::cmp::Ordering::Less
+            } else if b == "ara" {
+                std::cmp::Ordering::Greater
+            } else if a == "eng" {
+                std::cmp::Ordering::Less
+            } else if b == "eng" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.cmp(b)
+            }
+        });
+        Some(langs.join("+"))
     }
 }
 
@@ -403,7 +487,7 @@ fn main() -> eframe::Result<()> {
         .windows(2)
         .find(|w| w[0] == "--lang")
         .map(|w| w[1].clone())
-        .unwrap_or_else(|| "eng".to_string());
+        .unwrap_or_else(|| "auto".to_string());
     let debug = args.iter().any(|a| a == "--debug");
 
     let raw = match capture_screen() {
