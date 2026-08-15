@@ -1,8 +1,8 @@
 # snapocr
 
-A lightning-fast, self-contained screen OCR utility for Linux desktops (Wayland & X11).
+A fast, self-contained screen OCR utility for Linux desktops (Wayland and X11).
 
-Select any region on your screen, extract text (English, Arabic, code, symbols) using an optimized in-memory Tesseract pipeline, and copy the result directly to your clipboard with a native desktop notification.
+Select any region on your screen, extract text (English, Arabic, code, symbols) using an optimized in-memory Tesseract pipeline, and copy the result directly to your clipboard with a desktop notification.
 
 Zero external CLI dependencies required (no `slurp`, no `grim`).
 
@@ -10,15 +10,15 @@ Zero external CLI dependencies required (no `slurp`, no `grim`).
 
 ## Features
 
-- ⚡ **Instant & Self-Contained:** Native in-memory Wayland screencopy via `libwayshot` + interactive freeze-frame selector.
-- 🌍 **Auto Multi-Language OCR:** Detects and extracts Arabic and English text simultaneously (`eng+ara`) out-of-the-box.
-- 🎯 **High-Accuracy OCR Pipeline:**
-  - 2.5× Catmull-Rom upscaling to match 300 DPI neural OCR requirements.
-  - 24px white padding to preserve character connectors & glyph contours.
-  - Automatic dark-mode background detection & inversion.
+- **Self-Contained:** Native in-memory Wayland screencopy via `libwayshot` and interactive freeze-frame selector.
+- **Auto Multi-Language OCR:** Detects and extracts Arabic and English text simultaneously (`eng+ara`) out-of-the-box.
+- **High-Accuracy OCR Pipeline:**
+  - 2.5x Catmull-Rom upscaling to match 300 DPI neural OCR requirements.
+  - 24px white padding to preserve character connectors and glyph contours.
+  - Automatic dark-mode background detection and inversion.
   - Intelligent Page Segmentation Mode (PSM) fallback (PSM 13 for single-line UI titles/snippets, PSM 6 for multiline blocks).
-- 📋 **Seamless Clipboard & Alerts:** Copies to clipboard (`arboard` / `wl-copy`) and delivers a native desktop notification preview (`notify-send`).
-- ❄️ **Nix Flake First-Class Support:** Zero-friction build and dev environment with pinned dependencies.
+- **Clipboard and Alerts:** Copies to clipboard (`arboard` / `wl-copy`) and delivers a native desktop notification preview (`notify-send`).
+- **Nix Flake First-Class Support:** Zero-friction build and dev environment with pinned dependencies.
 
 ---
 
@@ -58,7 +58,7 @@ bindsym $mod+Shift+s exec snapocr
 
 ---
 
-## Building & Installation
+## Building and Installation
 
 ### With Nix Flakes (Recommended)
 
