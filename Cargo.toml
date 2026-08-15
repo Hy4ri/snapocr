@@ -1,13 +1,11 @@
 [package]
 name = "snapocr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Lean & fast screen OCR to clipboard for Wayland & X11"
+description = "Zero-dependency Wayland screen OCR to clipboard"
 
 [dependencies]
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png", "pnm"] }
-libwayshot = "0.9.0"
-smithay-client-toolkit = "0.21.1"
-wayland-client = "0.31.15"
-wayland-protocols-wlr = "0.3.12"
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "default_fonts"] }
+libwayshot = { version = "0.9", default-features = false }

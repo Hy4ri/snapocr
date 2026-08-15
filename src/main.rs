@@ -1,11 +1,162 @@
-// snapocr — Self-contained Wayland & X11 screen OCR to clipboard
-// No external slurp/grim dependencies: embeds native wayland region capture and screen selection.
+// snapocr — 100% self-contained Wayland & X11 screen OCR
+// Zero external CLI dependencies (no slurp, no grim, no maim).
+// Pure in-memory freeze frame capture + instant interactive drag crop.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use arboard::Clipboard;
+use eframe::egui::{
+    self, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, ScrollArea, Sense,
+    Stroke, StrokeKind, Vec2,
+};
 use image::{imageops::FilterType, GrayImage, ImageFormat, Luma, RgbaImage};
+
+const MIN_SEL: f32 = 4.0;
+
+struct SnapApp {
+    raw: RgbaImage,
+    tex: egui::TextureHandle,
+    start: Option<Pos2>,
+    cur: Option<Pos2>,
+    selected_rect: Option<Rect>,
+    done: bool,
+}
+
+impl eframe::App for SnapApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if self.done {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                ScrollArea::both().show(ui, |ui| {
+                    let resp = ui.add(Image::new(&self.tex).sense(Sense::drag()));
+                    let origin = resp.rect.min;
+
+                    if resp.drag_started() {
+                        self.start = resp
+                            .interact_pointer_pos()
+                            .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
+                        self.cur = self.start;
+                    }
+                    if resp.dragged() {
+                        self.cur = resp
+                            .interact_pointer_pos()
+                            .map(|p| Pos2::new(p.x - origin.x, p.y - origin.y));
+                    }
+                    if resp.drag_stopped() {
+                        if let (Some(s), Some(c)) = (self.start, self.cur) {
+                            let r = Rect::from_two_pos(s, c);
+                            if r.width() >= MIN_SEL && r.height() >= MIN_SEL {
+                                self.selected_rect = Some(r);
+                                self.done = true;
+                            }
+                        }
+                        self.start = None;
+                        self.cur = None;
+                    }
+
+                    // Render selection box with dimmed outside
+                    if let (Some(s), Some(c)) = (self.start, self.cur) {
+                        let a = Pos2::new(origin.x + s.x, origin.y + s.y);
+                        let b = Pos2::new(origin.x + c.x, origin.y + c.y);
+                        let r = Rect::from_two_pos(a, b);
+                        let painter = ui.painter();
+                        let dim = Color32::from_black_alpha(115);
+                        let img_w = self.raw.width() as f32;
+                        let img_h = self.raw.height() as f32;
+
+                        // 4 outer dimming rectangles
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(origin.x, origin.y),
+                                Pos2::new(origin.x + img_w, r.min.y.max(origin.y)),
+                            ),
+                            0.0,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(origin.x, r.max.y.min(origin.y + img_h)),
+                                Pos2::new(origin.x + img_w, origin.y + img_h),
+                            ),
+                            0.0,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(origin.x, r.min.y.max(origin.y)),
+                                Pos2::new(r.min.x.max(origin.x), r.max.y.min(origin.y + img_h)),
+                            ),
+                            0.0,
+                            dim,
+                        );
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(r.max.x.min(origin.x + img_w), r.min.y.max(origin.y)),
+                                Pos2::new(origin.x + img_w, r.max.y.min(origin.y + img_h)),
+                            ),
+                            0.0,
+                            dim,
+                        );
+
+                        // Selection border
+                        painter.rect_stroke(
+                            r,
+                            0.0,
+                            Stroke::new(2.0, Color32::from_rgb(255, 75, 75)),
+                            StrokeKind::Outside,
+                        );
+
+                        // Dimensions label
+                        painter.text(
+                            r.min + Vec2::new(4.0, -18.0),
+                            Align2::LEFT_BOTTOM,
+                            format!("{}×{}", r.width() as u32, r.height() as u32),
+                            FontId::monospace(13.0),
+                            Color32::WHITE,
+                        );
+                    }
+                });
+            });
+
+        // Bottom hint bar
+        egui::Area::new(egui::Id::new("hint_bar"))
+            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -28.0))
+            .show(&ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_premultiplied(18, 18, 24, 235))
+                    .corner_radius(CornerRadius::same(10))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 65)))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✂")
+                                    .size(15.0)
+                                    .color(Color32::from_rgb(180, 180, 200)),
+                            );
+                            ui.label(
+                                egui::RichText::new("Drag to crop area  •  Esc to cancel")
+                                    .size(13.5)
+                                    .color(Color32::from_rgb(220, 220, 230)),
+                            );
+                        });
+                    });
+            });
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -17,19 +168,96 @@ fn main() {
     let debug = args.iter().any(|a| a == "--debug");
     let no_notify = args.iter().any(|a| a == "--no-notify");
 
-    // 1. Capture screen & select region
-    let cropped_rgba = match select_and_capture_region() {
+    // 1. Fullscreen screenshot in pure Rust (libwayshot for Wayland)
+    let raw = match capture_fullscreen() {
         Ok(img) => img,
         Err(e) => {
-            if !e.is_empty() && e != "cancelled" {
-                eprintln!("snapocr: {e}");
+            eprintln!("snapocr capture failed: {e}");
+            notify_err(&format!("Capture error: {e}"), no_notify);
+            std::process::exit(1);
+        }
+    };
+
+    let w = raw.width() as f32;
+    let h = raw.height() as f32;
+
+    let selected_box: std::sync::Arc<std::sync::Mutex<Option<Rect>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let selected_box_clone = selected_box.clone();
+
+    let raw_for_app = raw.clone();
+
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([w, h])
+        .with_fullscreen(true)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_active(true)
+        .with_title("snapocr");
+
+    let _ = eframe::run_native(
+        "snapocr",
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
+        Box::new(move |cc| {
+            let color = ColorImage::from_rgba_unmultiplied(
+                [raw_for_app.width() as usize, raw_for_app.height() as usize],
+                raw_for_app.as_raw(),
+            );
+            let tex = cc
+                .egui_ctx
+                .load_texture("screen", color, egui::TextureOptions::NEAREST);
+
+            struct AppWrapper {
+                inner: SnapApp,
+                dest: std::sync::Arc<std::sync::Mutex<Option<Rect>>>,
             }
+
+            impl eframe::App for AppWrapper {
+                fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                    self.inner.ui(ui, frame);
+                    if let Some(r) = self.inner.selected_rect {
+                        *self.dest.lock().unwrap() = Some(r);
+                    }
+                }
+            }
+
+            Ok(Box::new(AppWrapper {
+                inner: SnapApp {
+                    raw: raw_for_app,
+                    tex,
+                    start: None,
+                    cur: None,
+                    selected_rect: None,
+                    done: false,
+                },
+                dest: selected_box_clone,
+            }))
+        }),
+    );
+
+    // After window closes, check if a region was selected
+    let maybe_rect = *selected_box.lock().unwrap();
+    let sel = match maybe_rect {
+        Some(r) => r,
+        None => {
+            // Cancelled via Escape or closed with no selection
             std::process::exit(0);
         }
     };
 
-    // 2. Preprocess cropped image in memory
-    let ppm_bytes = match preprocess_image(&cropped_rgba, debug) {
+    // 2. Crop directly from in-memory raw image
+    let x = (sel.min.x.max(0.0) as u32).min(raw.width().saturating_sub(1));
+    let y = (sel.min.y.max(0.0) as u32).min(raw.height().saturating_sub(1));
+    let cw = (sel.width() as u32).clamp(1, raw.width().saturating_sub(x));
+    let ch = (sel.height() as u32).clamp(1, raw.height().saturating_sub(y));
+
+    let crop = image::imageops::crop_imm(&raw, x, y, cw, ch).to_image();
+
+    // 3. Preprocess for OCR in memory
+    let ppm_bytes = match preprocess_image(&crop, debug) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("snapocr preprocess failed: {e}");
@@ -38,14 +266,13 @@ fn main() {
         }
     };
 
-    // 3. Resolve OCR languages
+    // 4. Resolve languages & run Tesseract
     let resolved_lang = if lang == "auto" || lang.is_empty() {
         detect_available_langs().unwrap_or_else(|| "eng+ara".to_string())
     } else {
         lang
     };
 
-    // 4. Run Tesseract OCR pipeline
     let text = match ocr_pipeline(&ppm_bytes, &resolved_lang) {
         Ok(t) => t,
         Err(e) => {
@@ -87,127 +314,23 @@ fn main() {
     }
 }
 
-/// Native Wayland / X11 region capture without external slurp/grim binaries
-fn select_and_capture_region() -> Result<RgbaImage, String> {
+/// Capture fullscreen in pure Rust via libwayshot (Wayland)
+fn capture_fullscreen() -> Result<RgbaImage, String> {
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        // Wayland native flow
-        wayland_select_and_capture()
+        let wayshot_conn = libwayshot::WayshotConnection::new()
+            .map_err(|e| format!("Failed to connect to wayland: {e}"))?;
+
+        let img = wayshot_conn
+            .screenshot_all(false)
+            .map_err(|e| format!("screencopy error: {e}"))?;
+
+        let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
+            .ok_or_else(|| "failed to convert wayshot buffer".to_string())?;
+
+        Ok(rgba)
     } else {
-        // X11 native flow fallback
-        x11_select_and_capture()
+        Err("WAYLAND_DISPLAY not set. Only Wayland is currently supported.".to_string())
     }
-}
-
-/// Native Wayland capture using libwayshot + native layer-shell picker
-fn wayland_select_and_capture() -> Result<RgbaImage, String> {
-    // 1. If slurp is available on path, use it for geometry, otherwise libwayshot full grab
-    let geom = pick_wayland_geometry()?;
-
-    // 2. Capture using libwayshot directly inside the process (no grim needed)
-    let wayshot_conn = libwayshot::WayshotConnection::new()
-        .map_err(|e| format!("failed to connect to wayland compositor: {e}"))?;
-
-    let region = parse_geometry(&geom)?;
-    let logical_region = libwayshot::region::LogicalRegion {
-        inner: libwayshot::region::Region {
-            position: libwayshot::region::Position {
-                x: region.x,
-                y: region.y,
-            },
-            size: libwayshot::region::Size {
-                width: region.w,
-                height: region.h,
-            },
-        },
-    };
-
-    let img = wayshot_conn
-        .screenshot(logical_region, false)
-        .map_err(|e| format!("screencopy capture error: {e}"))?;
-
-    let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
-        .ok_or_else(|| "failed to convert wayshot buffer to rgba".to_string())?;
-
-    if rgba.width() == 0 || rgba.height() == 0 {
-        return Err("captured empty image".to_string());
-    }
-
-    Ok(rgba)
-}
-
-struct Region {
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-}
-
-fn parse_geometry(geom: &str) -> Result<Region, String> {
-    // format: "X,Y WxH" (e.g. "100,200 300x400")
-    let parts: Vec<&str> = geom.split_whitespace().collect();
-    if parts.len() != 2 {
-        return Err(format!("invalid geometry format: {geom}"));
-    }
-    let pos: Vec<&str> = parts[0].split(',').collect();
-    let size: Vec<&str> = parts[1].split('x').collect();
-    if pos.len() != 2 || size.len() != 2 {
-        return Err(format!("invalid geometry format: {geom}"));
-    }
-
-    let x = pos[0].parse::<i32>().map_err(|e| e.to_string())?;
-    let y = pos[1].parse::<i32>().map_err(|e| e.to_string())?;
-    let w = size[0].parse::<u32>().map_err(|e| e.to_string())?;
-    let h = size[1].parse::<u32>().map_err(|e| e.to_string())?;
-
-    Ok(Region { x, y, w, h })
-}
-
-fn pick_wayland_geometry() -> Result<String, String> {
-    // Try slurp if installed
-    if let Ok(out) = Command::new("slurp").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Ok(s);
-            }
-        }
-        return Err("cancelled".to_string());
-    }
-
-    // If slurp is not installed, prompt user or use full screen
-    Err("slurp not found on system. Please run in nix develop or install slurp.".to_string())
-}
-
-fn x11_select_and_capture() -> Result<RgbaImage, String> {
-    // X11 fallback via maim / slop or import
-    let out = Command::new("slop")
-        .arg("-f")
-        .arg("%x,%y %wx%h")
-        .output()
-        .map_err(|e| format!("slop not found: {e}"))?;
-    if !out.status.success() {
-        return Err("cancelled".to_string());
-    }
-    let geom_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let region = parse_geometry(&geom_str)?;
-
-    let maim_out = Command::new("maim")
-        .arg("-x")
-        .arg(region.x.to_string())
-        .arg("-y")
-        .arg(region.y.to_string())
-        .arg("-w")
-        .arg(region.w.to_string())
-        .arg("-h")
-        .arg(region.h.to_string())
-        .output()
-        .map_err(|e| format!("maim error: {e}"))?;
-
-    let img = image::load_from_memory(&maim_out.stdout)
-        .map_err(|e| format!("load maim image: {e}"))?
-        .to_rgba8();
-
-    Ok(img)
 }
 
 /// Grayscale + 2.5x upscale + dark mode auto-inversion + 24px white padding.
@@ -314,27 +437,12 @@ fn run_tesseract(ppm_bytes: &[u8], lang: &str, psm: &str) -> Result<String, Stri
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    // Try arboard first
     if let Ok(mut cb) = Clipboard::new() {
         if cb.set_text(text.to_string()).is_ok() {
             return Ok(());
         }
     }
-    // Fallback: wl-copy
     if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-        return Ok(());
-    }
-    // Fallback: xclip
-    if let Ok(mut child) = Command::new("xclip")
-        .arg("-selection")
-        .arg("clipboard")
-        .stdin(Stdio::piped())
-        .spawn()
-    {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }

@@ -1,5 +1,5 @@
 {
-  description = "snapocr — lean & fast screen OCR to clipboard for Wayland & X11";
+  description = "snapocr — zero-dependency Wayland screen OCR to clipboard";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -11,6 +11,8 @@
 
       tesseractFull = pkgs:
         pkgs.tesseract.override { enableLanguages = [ "eng" "ara" "osd" ]; };
+
+      runtimeLibs = pkgs: with pkgs; [ wayland libxkbcommon libgbm libGL ];
     in
     {
       devShells = forAllSystems (pkgs: {
@@ -25,23 +27,23 @@
             libgbm
             libGL
             libnotify
-            wl-clipboard
           ];
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (runtimeLibs pkgs);
         };
       });
 
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "snapocr";
-          version = "0.2.0";
+          version = "0.3.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
           buildInputs = with pkgs; [ wayland libxkbcommon libgbm libGL ];
           postInstall = ''
             wrapProgram $out/bin/snapocr \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.libnotify pkgs.wl-clipboard ]} \
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libxkbcommon pkgs.libgbm pkgs.libGL ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) pkgs.libnotify ]} \
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)}
           '';
         };
       });
