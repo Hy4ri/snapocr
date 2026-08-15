@@ -1,0 +1,7 @@
+[package]
+name = "snapocr"
+version = "0.1.0"
+edition = "2021"
+description = "Select a screen region, OCR it, copy to clipboard"
+
+[dependencies]
