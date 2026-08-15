@@ -12,7 +12,7 @@
       tesseractFull = pkgs:
         pkgs.tesseract.override { enableLanguages = [ "eng" "ara" ]; };
 
-      runtimeLibs = pkgs: with pkgs; [ libGL libxkbcommon wayland xorg.libxcb ];
+      runtimeLibs = pkgs: with pkgs; [ libGL libxkbcommon wayland libxcb libgbm ];
     in
     {
       devShells = forAllSystems (pkgs: {
@@ -23,14 +23,14 @@
             pkg-config
             (tesseractFull pkgs)
             # x11/wayland libs for eframe + xcap
-            xorg.libxcb
-            xorg.xcbproto
+            libxcb
+            xcb-proto
             libxkbcommon
             wayland
             libGL
             fontconfig
             dejavu_fonts
-            # xcap wayland capture backend (pipewire portal)
+            # xcap wayland capture backend (pipewire + gbm)
             pipewire
             libgbm
             # pipewire-sys bindgen needs libclang
@@ -54,8 +54,9 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
-          buildInputs = with pkgs; [ xorg.libxcb xorg.xcbproto libxkbcommon wayland libGL pipewire ];
+          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper clang libclang.lib ];
+          buildInputs = with pkgs; [ libxcb xcb-proto libxkbcommon wayland libGL pipewire libgbm ];
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           postInstall = ''
             wrapProgram $out/bin/snapocr \
               --prefix PATH : ${pkgs.lib.makeBinPath [ (tesseractFull pkgs) ]} \
