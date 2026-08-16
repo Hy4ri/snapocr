@@ -1,6 +1,6 @@
 // snapocr — 100% self-contained Wayland & X11 screen OCR
 // Zero external CLI dependencies (no slurp, no grim, no maim).
-// Pure in-memory freeze frame capture + instant interactive drag crop.
+// Pure in-memory freeze frame capture + instant interactive drag crop + multi-monitor support.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -160,16 +160,34 @@ impl eframe::App for SnapApp {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+
+    if args.iter().any(|a| a == "--list-monitors") {
+        list_monitors();
+        return;
+    }
+
     let lang = args
         .windows(2)
         .find(|w| w[0] == "--lang")
         .map(|w| w[1].clone())
         .unwrap_or_else(|| "auto".to_string());
+
+    let target_monitor = args
+        .windows(2)
+        .find(|w| w[0] == "--monitor" || w[0] == "-m")
+        .map(|w| w[1].clone());
+
+    let all_monitors = args.iter().any(|a| a == "--all");
     let debug = args.iter().any(|a| a == "--debug");
     let no_notify = args.iter().any(|a| a == "--no-notify");
 
     // 1. Fullscreen screenshot in pure Rust (libwayshot for Wayland)
-    let raw = match capture_fullscreen() {
+    let raw = match capture_fullscreen(target_monitor.as_deref(), all_monitors) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("snapocr capture failed: {e}");
@@ -314,14 +332,106 @@ fn main() {
     }
 }
 
-/// Capture fullscreen in pure Rust via libwayshot (Wayland)
-fn capture_fullscreen() -> Result<RgbaImage, String> {
+fn print_help() {
+    println!("snapocr — fast, zero-dependency screen OCR to clipboard");
+    println!();
+    println!("USAGE:");
+    println!("  snapocr [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("  --lang <lang>          Language code for OCR (default: auto, detects eng+ara)");
+    println!("  --monitor, -m <name>   Target a specific monitor (e.g. DP-1, HDMI-A-1, 0, 1)");
+    println!("  --all                  Capture all monitors combined into a single canvas");
+    println!("  --list-monitors        List available Wayland outputs and exit");
+    println!("  --debug                Save preprocessed image to /tmp for debugging");
+    println!("  --no-notify            Suppress desktop notifications");
+    println!("  -h, --help             Print help information");
+}
+
+fn list_monitors() {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        match libwayshot::WayshotConnection::new() {
+            Ok(conn) => {
+                let outputs = conn.get_all_outputs();
+                println!("Detected {} output(s):", outputs.len());
+                for (idx, out) in outputs.iter().enumerate() {
+                    let pos = out.logical_region.inner.position;
+                    let size = out.logical_region.inner.size;
+                    println!(
+                        "  [{idx}] {name} ({desc}) - {w}x{h} at +{x}+{y}",
+                        name = out.name,
+                        desc = out.description,
+                        w = size.width,
+                        h = size.height,
+                        x = pos.x,
+                        y = pos.y
+                    );
+                }
+            }
+            Err(e) => eprintln!("Failed to connect to wayland: {e}"),
+        }
+    } else {
+        println!("Not running under Wayland.");
+    }
+}
+
+/// Capture fullscreen in pure Rust via libwayshot (Wayland) with multi-monitor support
+fn capture_fullscreen(target_monitor: Option<&str>, all_monitors: bool) -> Result<RgbaImage, String> {
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
         let wayshot_conn = libwayshot::WayshotConnection::new()
             .map_err(|e| format!("Failed to connect to wayland: {e}"))?;
 
+        let outputs = wayshot_conn.get_all_outputs();
+        if outputs.is_empty() {
+            return Err("No wayland outputs found".to_string());
+        }
+
+        // Case 1: Explicitly capture all monitors combined
+        if all_monitors {
+            let img = wayshot_conn
+                .screenshot_all(false)
+                .map_err(|e| format!("screencopy error: {e}"))?;
+            let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
+                .ok_or_else(|| "failed to convert wayshot buffer".to_string())?;
+            return Ok(rgba);
+        }
+
+        // Case 2: Only 1 monitor connected
+        if outputs.len() == 1 {
+            let img = wayshot_conn
+                .screenshot_single_output(&outputs[0], false)
+                .map_err(|e| format!("screencopy error: {e}"))?;
+            let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
+                .ok_or_else(|| "failed to convert wayshot buffer".to_string())?;
+            return Ok(rgba);
+        }
+
+        // Case 3: Multiple monitors connected
+        // Resolve target output: either explicitly specified, auto-detected active output, or first output
+        let selected_output = if let Some(target) = target_monitor {
+            outputs
+                .iter()
+                .find(|o| o.name.eq_ignore_ascii_case(target) || o.description.to_lowercase().contains(&target.to_lowercase()))
+                .or_else(|| {
+                    if let Ok(idx) = target.parse::<usize>() {
+                        outputs.get(idx)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            // Auto-detect focused monitor from Hyprland / Sway
+            detect_focused_monitor_name()
+                .and_then(|focused_name| outputs.iter().find(|o| o.name == focused_name))
+        };
+
+        let output_to_capture = selected_output.unwrap_or_else(|| {
+            eprintln!("snapocr: active monitor not detected, defaulting to primary: {}", outputs[0].name);
+            &outputs[0]
+        });
+
         let img = wayshot_conn
-            .screenshot_all(false)
+            .screenshot_single_output(output_to_capture, false)
             .map_err(|e| format!("screencopy error: {e}"))?;
 
         let rgba = image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8().into_vec())
@@ -331,6 +441,48 @@ fn capture_fullscreen() -> Result<RgbaImage, String> {
     } else {
         Err("WAYLAND_DISPLAY not set. Only Wayland is currently supported.".to_string())
     }
+}
+
+/// Detect the active/focused monitor name from compositor IPC
+fn detect_focused_monitor_name() -> Option<String> {
+    // 1. Hyprland: hyprctl monitors -j
+    if let Ok(out) = Command::new("hyprctl").arg("monitors").arg("-j").output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(name) = parse_focused_monitor_json(&stdout) {
+                return Some(name);
+            }
+        }
+    }
+
+    // 2. Sway: swaymsg -t get_outputs -r
+    if let Ok(out) = Command::new("swaymsg").arg("-t").arg("get_outputs").arg("-r").output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(name) = parse_focused_monitor_json(&stdout) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_focused_monitor_json(json_str: &str) -> Option<String> {
+    for block in json_str.split('}') {
+        if block.contains("\"focused\": true") || block.contains("\"focused\":true") {
+            if let Some(idx) = block.find("\"name\"") {
+                let after = &block[idx + 6..];
+                if let Some(q1) = after.find('"') {
+                    let rest = &after[q1 + 1..];
+                    if let Some(q2) = rest.find('"') {
+                        return Some(rest[..q2].to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Grayscale + 2.5x upscale + dark mode auto-inversion + 24px white padding.
