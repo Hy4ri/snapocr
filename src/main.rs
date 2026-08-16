@@ -1,6 +1,6 @@
 // snapocr — 100% self-contained Wayland & X11 screen OCR
-// Zero external CLI dependencies (no slurp, no grim, no maim).
-// Pure in-memory freeze frame capture + instant interactive drag crop + multi-monitor support.
+// Multi-monitor aware: captures active monitor or custom display target,
+// and maps selection coordinates accurately.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -407,7 +407,7 @@ fn capture_fullscreen(target_monitor: Option<&str>, all_monitors: bool) -> Resul
         }
 
         // Case 3: Multiple monitors connected
-        // Resolve target output: either explicitly specified, auto-detected active output, or first output
+        // Resolve target output: either explicitly specified, auto-detected from cursor/focus, or primary
         let selected_output = if let Some(target) = target_monitor {
             outputs
                 .iter()
@@ -420,9 +420,8 @@ fn capture_fullscreen(target_monitor: Option<&str>, all_monitors: bool) -> Resul
                     }
                 })
         } else {
-            // Auto-detect focused monitor from Hyprland / Sway
-            detect_focused_monitor_name()
-                .and_then(|focused_name| outputs.iter().find(|o| o.name == focused_name))
+            // Auto-detect which monitor contains the cursor position or active focus
+            detect_cursor_or_focused_output(outputs)
         };
 
         let output_to_capture = selected_output.unwrap_or_else(|| {
@@ -443,24 +442,52 @@ fn capture_fullscreen(target_monitor: Option<&str>, all_monitors: bool) -> Resul
     }
 }
 
-/// Detect the active/focused monitor name from compositor IPC
-fn detect_focused_monitor_name() -> Option<String> {
-    // 1. Hyprland: hyprctl monitors -j
-    if let Ok(out) = Command::new("hyprctl").arg("monitors").arg("-j").output() {
+/// Detect which monitor currently contains the cursor, or has keyboard focus
+fn detect_cursor_or_focused_output<'a>(outputs: &'a [libwayshot::output::OutputInfo]) -> Option<&'a libwayshot::output::OutputInfo> {
+    ensure_hyprland_signature_env();
+
+    // Strategy 1: Check cursor coordinate on Hyprland (hyprctl cursorpos)
+    if let Ok(out) = Command::new("hyprctl").arg("cursorpos").output() {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Some(name) = parse_focused_monitor_json(&stdout) {
-                return Some(name);
+            if let Some((cx, cy)) = parse_cursor_coords(&stdout) {
+                // Find output that bounds this (cx, cy) in logical coordinates
+                for out in outputs {
+                    let pos = out.logical_region.inner.position;
+                    let size = out.logical_region.inner.size;
+                    let x1 = pos.x;
+                    let y1 = pos.y;
+                    let x2 = pos.x + size.width as i32;
+                    let y2 = pos.y + size.height as i32;
+
+                    if cx >= x1 && cx < x2 && cy >= y1 && cy < y2 {
+                        return Some(out);
+                    }
+                }
             }
         }
     }
 
-    // 2. Sway: swaymsg -t get_outputs -r
+    // Strategy 2: Check Hyprland focused monitor (hyprctl monitors -j)
+    if let Ok(out) = Command::new("hyprctl").arg("monitors").arg("-j").output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(focused_name) = parse_hyprland_focused_name(&stdout) {
+                if let Some(matching) = outputs.iter().find(|o| o.name == focused_name) {
+                    return Some(matching);
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Check Sway focused output (swaymsg -t get_outputs -r)
     if let Ok(out) = Command::new("swaymsg").arg("-t").arg("get_outputs").arg("-r").output() {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Some(name) = parse_focused_monitor_json(&stdout) {
-                return Some(name);
+            if let Some(focused_name) = parse_sway_focused_name(&stdout) {
+                if let Some(matching) = outputs.iter().find(|o| o.name == focused_name) {
+                    return Some(matching);
+                }
             }
         }
     }
@@ -468,7 +495,66 @@ fn detect_focused_monitor_name() -> Option<String> {
     None
 }
 
-fn parse_focused_monitor_json(json_str: &str) -> Option<String> {
+/// Ensures HYPRLAND_INSTANCE_SIGNATURE is populated from /run/user/<uid>/hypr if missing
+fn ensure_hyprland_signature_env() {
+    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
+        return;
+    }
+
+    let uid = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .and_then(|dir| {
+            dir.rsplit('/')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(1000);
+    let hypr_dir = format!("/run/user/{uid}/hypr");
+    if let Ok(entries) = std::fs::read_dir(hypr_dir) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    if let Some(sig) = entry.file_name().to_str() {
+                        if sig.contains('_') {
+                            std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_cursor_coords(output: &str) -> Option<(i32, i32)> {
+    // format: "X, Y" (e.g. "1950, 420")
+    let parts: Vec<&str> = output.split(',').collect();
+    if parts.len() == 2 {
+        let x = parts[0].trim().parse::<i32>().ok()?;
+        let y = parts[1].trim().parse::<i32>().ok()?;
+        return Some((x, y));
+    }
+    None
+}
+
+fn parse_hyprland_focused_name(json_str: &str) -> Option<String> {
+    for block in json_str.split('}') {
+        if block.contains("\"focused\": true") || block.contains("\"focused\":true") {
+            if let Some(idx) = block.find("\"name\"") {
+                let after = &block[idx + 6..];
+                if let Some(q1) = after.find('"') {
+                    let rest = &after[q1 + 1..];
+                    if let Some(q2) = rest.find('"') {
+                        return Some(rest[..q2].to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_sway_focused_name(json_str: &str) -> Option<String> {
     for block in json_str.split('}') {
         if block.contains("\"focused\": true") || block.contains("\"focused\":true") {
             if let Some(idx) = block.find("\"name\"") {
