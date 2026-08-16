@@ -11,6 +11,7 @@ Zero external CLI dependencies required (no `slurp`, no `grim`).
 ## Features
 
 - **Self-Contained:** Native in-memory Wayland screencopy via `libwayshot` and interactive freeze-frame selector.
+- **Multi-Monitor Support:** Automatically detects and captures the active/focused monitor on multi-display setups (Hyprland and Sway IPC), preventing scaling distortion or window displacement.
 - **Auto Multi-Language OCR:** Detects and extracts Arabic and English text simultaneously (`eng+ara`) out-of-the-box.
 - **High-Accuracy OCR Pipeline:**
   - 2.5x Catmull-Rom upscaling to match 300 DPI neural OCR requirements.
@@ -25,8 +26,18 @@ Zero external CLI dependencies required (no `slurp`, no `grim`).
 ## Usage
 
 ```bash
-# Default: interactive crop with automatic language detection (English + Arabic)
+# Default: interactive crop on active monitor with automatic language detection (English + Arabic)
 snapocr
+
+# Target a specific monitor
+snapocr --monitor DP-1
+snapocr --monitor 1
+
+# Capture all monitors combined into a single canvas
+snapocr --all
+
+# List detected outputs
+snapocr --list-monitors
 
 # Force a specific language
 snapocr --lang eng
