@@ -1,6 +1,6 @@
 [package]
 name = "snapocr"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 description = "Zero-dependency Wayland screen OCR to clipboard"
 
