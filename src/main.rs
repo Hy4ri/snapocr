@@ -7,8 +7,8 @@ use std::process::{Command, Stdio};
 
 use arboard::Clipboard;
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, ScrollArea, Sense,
-    Stroke, StrokeKind, Vec2,
+    self, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Image, Pos2, Rect,
+    ScrollArea, Sense, Stroke, StrokeKind, Vec2,
 };
 use image::{imageops::FilterType, GrayImage, ImageFormat, Luma, RgbaImage};
 
@@ -26,6 +26,7 @@ struct SnapApp {
 impl eframe::App for SnapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ctx.set_cursor_icon(CursorIcon::Crosshair);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -186,7 +187,7 @@ fn main() {
     let debug = args.iter().any(|a| a == "--debug");
     let no_notify = args.iter().any(|a| a == "--no-notify");
 
-    // 1. Fullscreen screenshot in pure Rust (libwayshot for Wayland)
+    // 1. Fullscreen screenshot in pure Rust (libwayshot for Wayland, cursor disabled)
     let raw = match capture_fullscreen(target_monitor.as_deref(), all_monitors) {
         Ok(img) => img,
         Err(e) => {
@@ -429,6 +430,7 @@ fn capture_fullscreen(target_monitor: Option<&str>, all_monitors: bool) -> Resul
             &outputs[0]
         });
 
+        // cursor_overlay is false -> cursor is excluded from the captured bitmap
         let img = wayshot_conn
             .screenshot_single_output(output_to_capture, false)
             .map_err(|e| format!("screencopy error: {e}"))?;
@@ -527,7 +529,6 @@ fn ensure_hyprland_signature_env() {
 }
 
 fn parse_cursor_coords(output: &str) -> Option<(i32, i32)> {
-    // format: "X, Y" (e.g. "1950, 420")
     let parts: Vec<&str> = output.split(',').collect();
     if parts.len() == 2 {
         let x = parts[0].trim().parse::<i32>().ok()?;
